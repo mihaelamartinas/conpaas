@@ -209,6 +209,7 @@ class MGeneral(object):
         """Poll the state of service 'sid' till it matches 'state'."""
         res = { 'state': None }
 
+	log('[wait for state] ' + state )
         while res['state'] != state:
             try:
                 res = callmanager(sid, "get_service_info", False, {})
@@ -259,14 +260,31 @@ class MGeneral(object):
 
         return res
 
-    def add_nodes(self, service_id, params):
+    def add_nodes(self, service_id, nodes, params):
         params['cloud'] = 'default'
+        params['no_nodes'] = len(nodes)
+       
+        """send to manager info about VMs to be associated with the
+            agents
+        """
+        for i in range(0, len(nodes)):
+            base = 'node' + str(i)
+            params[base + '_vmid'] = nodes[i].vmid
+            params[base + '_id'] = nodes[i].id
+            params[base + '_ip'] = nodes[i].ip
+            params[base + '_private_ip'] = nodes[i].private_ip
+            params[base + '_cloud_name'] = nodes[i].cloud_name
+            params[base + '_weightBackend'] = nodes[i].weightBackend
 
+        log(params)
         res = callmanager(service_id, 'add_nodes', True, params)
 
         return res
 
-    def start(self, json, appid, need_env=False):
+    def get_no_instances(self, json):
+        return 1
+
+    def start(self, json, appid, vm_node, need_env=False):
         """Start the given service. Return service id upon successful
         termination."""
         servicetype = json.get('Type')
@@ -275,13 +293,15 @@ class MGeneral(object):
         if json.get('Cloud'):
             cloud = json.get('Cloud')
 
-        res = service_start(servicetype, cloud, appid)
+	log("[MGeneral] service_start")
+        res = service_start(servicetype, cloud, appid, vm_node)
         error = self.check_error(res)
         if error:
             return error
 
         sid = simplejson.loads(res.data).get('sid')
 
+	log('[MGeneral][start] waiting for INIT state')
         self.wait_for_state(sid, 'INIT')
 
         if json.get('ServiceName'):
@@ -373,24 +393,32 @@ class MPhp(MGeneral):
 
         return res
 
-    def start(self, json, appid):
-        sid = MGeneral.start(self, json, appid, need_env=True)
+    def get_no_instances(self, json):
+        no_instances = MGeneral.get_no_instances(self, json)
 
-        if type(sid) != int:
-            # Error!
-            return sid
+        if json.get('StartupInstances'):
+            params = {
+                    'proxy': 1,
+                    'web': 1,
+                    'backend': 1
+            }
 
-        if json.get('Archive'):
-            res = self.upload_code(sid, json.get('Archive'))
-            if 'error' in res:
-                return res['error']
+            if json.get('StartupInstances').get('proxy'):
+                params['proxy'] = int(json.get('StartupInstances').get('proxy'))
+                params['proxy'] -= 1
+            if json.get('StartupInstances').get('web'):
+                params['web'] = int(json.get('StartupInstances').get('web'))
+                params['web'] -= 1
+            if json.get('StartupInstances').get('backend'):
+                params['backend'] = int(json.get('StartupInstances').get('backend'))
+                params['backend'] -= 1
 
-            res = self.enable_code(sid, res['codeVersionId']);
-            if 'error' in res:
-                return res['error']
+            if params['proxy'] or params['web'] or params['backend']:
+                no_instances += params['proxy'] + params['web'] + params['backend']
 
-            self.wait_for_state(sid, 'RUNNING')
+        return no_instances
 
+    def add_nodes(self, service_id, nodes, json):
         if json.get('StartupInstances'):
             params = {
                     'proxy': 1,
@@ -411,11 +439,31 @@ class MPhp(MGeneral):
             if params['proxy'] or params['web'] or params['backend']:
                 # Add nodes only if at least one additional node has been
                 # requested
-                res = self.add_nodes(sid, params)
+                res = MGeneral.add_nodes(sid, nodes, params)
                 if 'error' in res:
                     log('PHP.start: error calling add_nodes -> %s' % res)
                     return res['error']
+       
+        return 'ok' 
 
+    def start(self, json, appid, vm_node):
+        sid = MGeneral.start(self, json, appid, vm_node, need_env=True)
+
+        if type(sid) != int:
+            # Error!
+            return sid
+
+        if json.get('Archive'):
+            res = self.upload_code(sid, json.get('Archive'))
+            if 'error' in res:
+                return res['error']
+
+            res = self.enable_code(sid, res['codeVersionId']);
+            if 'error' in res:
+                return res['error']
+
+            self.wait_for_state(sid, 'RUNNING')
+        
         return 'ok'
 
 class MJava(MPhp):
@@ -469,8 +517,33 @@ class MMySql(MGeneral):
 
         return res
 
-    def start(self, json, appid):
-        sid = MGeneral.start(self, json, appid)
+    def get_no_instances(self, json):
+        no_instances = MGeneral.get_no_instances(self, json)
+        
+        if json.get('StartupInstances'):
+            if json.get('StartupInstances').get('slaves'):
+                no_instances += int(json.get('StartupInstances').get('slaves'))
+
+        return no_instances
+
+    def add_nodes(self, service_id, nodes, json):
+
+        if json.get('StartupInstances'):
+            params = {
+                    'slaves': 0
+            }
+
+            if json.get('StartupInstances').get('slaves'):
+                params['slaves'] = int(json.get('StartupInstances').get('slaves'))
+
+            res = MGeneral.add_nodes(sid, nodes, params)
+            if 'error' in res:
+                return res['error']
+        
+        return 'ok'
+
+    def start(self, json, appid, vm_node):
+        sid = MGeneral.start(self, json, appid, vm_node)
 
         if type(sid) != int:
             # Error!
@@ -485,29 +558,20 @@ class MMySql(MGeneral):
             res = self.load_dump(sid, json.get('Dump'))
             if 'error' in res:
                 return res['error']
-
-        if json.get('StartupInstances'):
-            params = {
-                    'slaves': 0
-            }
-
-            if json.get('StartupInstances').get('slaves'):
-                params['slaves'] = int(json.get('StartupInstances').get('slaves'))
-
-            res = self.add_nodes(sid, params)
-            if 'error' in res:
-                return res['error']
-
         return 'ok'
+      
 
 class MScalaris(MGeneral):
-    def start(self, json, appid):
-        sid = MGeneral.start(self, json, appid)
+    def get_no_instances(self, json):
+        no_instances = MGeneral.get_no_instances(self, json)
+       
+        if json.get('StartupInstances'):
+           if json.get('StartupInstances').get('scalaris'):
+               no_instances += int(json.get('StartupInstances').get('scalaris'))
 
-        if type(sid) != int:
-            # Error!
-            return sid
+        return no_instances
 
+    def add_nodes(self, service_id, nodes, json):
         if json.get('StartupInstances'):
             params = {
                     'scalaris': 1
@@ -516,20 +580,31 @@ class MScalaris(MGeneral):
             if json.get('StartupInstances').get('scalaris'):
                 params['scalaris'] = int(json.get('StartupInstances').get('scalaris'))
 
-            res = self.add_nodes(sid, params)
+            res = MGeneral.add_nodes(sid, nodes, params)
             if 'error' in res:
                 return res['error']
-
         return 'ok'
 
-class MHadoop(MGeneral):
-    def start(self, json, appid):
-        sid = MGeneral.start(self, json, appid)
+    def start(self, json, appid, vm_nodes):
+        sid = MGeneral.start(self, json, appid, vm_node)
 
         if type(sid) != int:
             # Error!
             return sid
+       
+        return 'ok'
 
+class MHadoop(MGeneral):
+    def get_no_instances(self, json):
+        no_instances = MGeneral.get_no_instances(self, json)
+       
+        if json.get('StartupInstances'):
+           if json.get('StartupInstances').get('workers'):
+               no_instances += int(json.get('StartupInstances').get('workers'))
+
+        return no_instances
+
+    def add_nodes(self, service_id, nodes, json):
         if json.get('StartupInstances'):
             params = {
                     'workers': 1
@@ -538,20 +613,33 @@ class MHadoop(MGeneral):
             if json.get('StartupInstances').get('workers'):
                 params['workers'] = int(json.get('StartupInstances').get('workers'))
 
-            res = self.add_nodes(sid, params)
+            nodes = get_subarray(vm_nodes, 1, params['workers'])
+            res = MGeneral.add_nodes(sid, nodes, params)
+
             if 'error' in res:
                 return res['error']
 
         return 'ok'
-
-class MSelenium(MGeneral):
-    def start(self, json, appid):
-        sid = MGeneral.start(self, json, appid)
+        
+    def start(self, json, appid, vm_nodes):
+        sid = MGeneral.start(self, json, appid, vm_nodes)
 
         if type(sid) != int:
             # Error!
             return sid
+        
+        return 'ok'
 
+class MSelenium(MGeneral):
+    def get_no_instances(self, json):
+        no_instances = MGeneral.get_no_instances(self, json)
+       
+        if json.get('StartupInstances'):
+           if json.get('StartupInstances').get('node'):
+               no_instances += int(json.get('StartupInstances').get('node'))
+        return no_instances
+
+    def add_nodes(self, service_id, nodes, json):
         if json.get('StartupInstances'):
             params = {
                     'node': 1
@@ -560,10 +648,18 @@ class MSelenium(MGeneral):
             if json.get('StartupInstances').get('node'):
                 params['node'] = int(json.get('StartupInstances').get('node'))
 
-            res = self.add_nodes(sid, params)
+            res = MGeneral.add_nodes(sid, nodes, params)
             if 'error' in res:
                 return res['error']
+        return 'ok'
 
+    def start(self, json, appid, vm_node):
+        sid = MGeneral.start(self, json, appid, vm_node)
+
+        if type(sid) != int:
+            # Error!
+            return sid
+              
         return 'ok'
 
 class MXTreemFS(MGeneral):
@@ -634,7 +730,24 @@ class MXTreemFS(MGeneral):
 
         return callmanager(service_id, "startup", True, data)
 
-    def start(self, json, appid):
+    def get_no_instances(self, json):
+        no_instances = MGeneral.get_no_instances(self, json)
+
+        if json.get('StartupInstances'):
+            params = {
+                    'osd': 1
+            }
+
+            if json.get('StartupInstances').get('osd'):
+                params['osd'] = int(json.get('StartupInstances').get('osd'))
+
+            # We have started the service already, so one OSD node is there
+            # for sure.
+            no_instances += params['osd'] - 1
+
+        return no_instances
+
+    def start(self, json, appid, vm_nodes):
         try:
             to_resume = { 'nodes': json['StartupInstances']['resume']['nodes'], 
                           'manager' : json['StartupInstances']['resume']['manager'] }
@@ -644,7 +757,7 @@ class MXTreemFS(MGeneral):
         # Set the resuming flag if necessary
         self.resuming = to_resume != {}
 
-        sid = MGeneral.start(self, json, appid)
+        sid = MGeneral.start(self, json, appid, vm_nodes)
 
         if type(sid) != int:
             # Error!
@@ -662,6 +775,7 @@ class MXTreemFS(MGeneral):
                 if 'error' in res:
                     return res['error']
 
+        
         if json.get('StartupInstances'):
             params = {
                     'osd': 1
@@ -676,7 +790,8 @@ class MXTreemFS(MGeneral):
             
             params['resuming'] = to_resume
 
-            res = self.add_nodes(sid, params)
+            nodes = subarray(vm_nodes, 1, params['osd'])
+            res = self.add_nodes(sid, nodes, params)
             if 'error' in res:
                 return res['error']
 
@@ -690,17 +805,26 @@ class MXTreemFS(MGeneral):
                     return res['error']
             else:
                 log('No xtreemfs node to be resumed')
-
+        
         return 'ok'
 
-class MTaskFarm(MGeneral):
-    def start(self, json, appid):
-        sid = MGeneral.start(self, json, appid)
+class MTaskFarm(MGeneral):  
+    def get_no_instances(self, json):
+        no_instances = MGeneral.get_no_instances(self, json)
+
+        if json.get('StartupInstances'):
+            if json.get('StartupInstances').get('node'):
+                no_instances += int(json.get('StartupInstances').get('node'))
+        return no_instances
+
+    def start(self, json, appid, vm_nodes):
+        sid = MGeneral.start(self, json, appid, vm_nodes)
 
         if type(sid) != int:
             # Error!
             return sid
 
+        
         if json.get('StartupInstances'):
             params = {
                     'node': 1
@@ -709,10 +833,11 @@ class MTaskFarm(MGeneral):
             if json.get('StartupInstances').get('node'):
                 params['node'] = int(json.get('StartupInstances').get('node'))
 
-            res = self.add_nodes(sid, params)
+            nodes = get_subarray(vm_nodes, 1, params['node'])
+            res = self.add_nodes(sid, nodes, params)
             if 'error' in res:
                 return res['error']
-
+       
         return 'ok'
 
 class MHtc(MGeneral):
@@ -747,16 +872,12 @@ def get_manifest_class(service_type):
 
 from cpsdirector.application import check_app_exists
 from cpsdirector.application import _createapp as createapp
-def new_manifest(json):
-    try:
-        parse = simplejson.loads(json)
-    except:
-        return 'Error parsing json'
 
+def app_validation(json, parse):
     # 'Application' has to be defined
     app_name = parse.get('Application')
     if not app_name:
-        return 'Application is not defined'
+        return {'status':'Application is not defined', 'appid':'99'}
 
     if not check_app_exists(app_name):
         # Create application if it does not exist yet
@@ -773,10 +894,162 @@ def new_manifest(json):
 
         # If all the applications exists, then exit
         if i is 99:
-            return 'Application can not be created'
+            return {'status': 'Application can not be created', 'appid' : '99'}
 
     if not parse.get('Services'):
-        return 'ok'
+        return {'status': 'ok',
+                'appid': '99'
+                }
+
+    return {'status': 'continue',
+            'appid': str(appid)
+            }
+
+
+def get_subarray(nodes, current_offset, no_nodes):
+    nodes_for_service = []
+
+    if current_offset + no_nodes > len(nodes):
+        return nodes_for_service
+
+    for it in range(current_offset, current_offset + no_nodes):
+        nodes_for_service.append(nodes[it])
+
+    return nodes_for_service
+
+from cpsdirector.startup import Startup
+
+def new_manifest(json):
+    try:
+        parse = simplejson.loads(json)
+    except:
+        return 'Error parsing json'
+
+    ret_app = app_validation(json, parse)
+    
+
+    if ret_app['status'] != 'continue':
+        return ret_app['status']
+
+    no_instances = 0
+    no_services = 0
+
+    vm_for_service = {}
+
+    # First startup phase
+    for service in parse.get('Services'):
+        try:
+            cls = get_manifest_class(service.get('Type'))
+        except Exception:
+            return 'Service %s does not exists' % service.get('Type')
+
+        #count number of virtual machines to be started
+        no_instances_service = cls().get_no_instances(service)
+        no_instances += no_instances_service
+        
+        #store number of instances for each service
+        vm_info_tmp = {}
+        vm_info_tmp ['type'] = service
+        vm_info_tmp ['sid'] = -1
+        vm_info_tmp ['manager'] = 1
+        vm_info_tmp ['agent'] = no_instances_service - 1
+        vm_for_service[no_services] = vm_info_tmp
+        no_services += 1
+
+
+    #start the virtual machines corresponding to the services
+    vm_controller = Startup()
+    vm_controller.start_vm(no_instances, ret_app['appid'])
+
+    current_service_idx = 0  
+    """
+       while not enough virtual machines were started loop and assign context to the
+       already created ones
+    """
+    while len(vm_controller.ready) < no_instances:
+	vms_created = vm_controller.wait_for_nodes()
+        if len(vms_created) == 0:
+            log ('[new_manifest] no machines created meanwhile\n')
+            continue
+ 	# verify to which service the nodes should be assigned
+        if current_service_idx >= no_services:
+            log ("[new_manifest] enough virtual machines created\n")
+            break
+        log ("[new_manifest] vms_created_size %s" %(str(len(vms_created))))
+
+        used_vms = 0
+        while used_vms < len(vms_created):
+            log ("[new_manifest] used_vms %s" %(str(used_vms)))
+            service_vm_info = vm_for_service[current_service_idx]
+
+            try:
+                cls = get_manifest_class(service_vm_info['type'].get('Type'))
+            except Exception:
+                return 'Service %s does not exist' % service_vm_info['type'].get('Type')
+
+            log( "[new_manifest] Service name %s" %service_vm_info['type'].get('Type'))
+            #assign context to manager
+            if service_vm_info['manager'] != 0:
+            	log( "[new_manifest] manager assigned context\n")
+                cls().start(service_vm_info['type'], ret_app['appid'], vms_created[used_vms])
+                service_vm_info['manager'] = 0
+                used_vms += 1
+            else:
+                #add agent nodes to manager
+                if service_vm_info['agent'] != 0:
+            	    sid = Service.query.filter_by(application_id=appid, type=cls).first().sid
+                    if len(vms_created) - used_vms <= service_vm_info['agent']:
+                        no_machines_needed = service_vm_info['agent']
+                    else:
+                        no_machines_needed = len(vms_created) - used_vms
+
+            	    log( "[new_manifest] agent %s" %(str(no_machines_needed)))
+                    cls().add_nodes(sid, vms_created[used_vms::used_vms + no_machines_needed])
+                    used_vms += no_machines_needed
+                    service_vm_info['agent'] -= no_machines_needed
+                else:
+                    #all machines were created for the service, go to next one
+                    current_service_idx += 1
+                
+   
+
+    """ Associate context to VMs: send the already created nodes to each
+    start.
+    current_offset = 0
+    for service in parse.get('Services'):
+        try:
+            cls = get_manifest_class(service.get('Type'))
+        except Exception:
+            return 'Service %s does not exists' % service.get('Type')
+
+        no_vms = vm_for_service[service.get('Type')]
+        nodes_for_service = get_subarray(started_nodes, current_offset, no_vms)
+	current_offset += no_vms
+
+        if len(nodes_for_service) == 0:
+            log('[new_manifest]: not enough virtual machines started')
+            return 'not enough virtual machines started'
+
+        msg = cls().start(service, ret_app['appid'], nodes_for_service)
+
+        if msg is not 'ok':
+            log('new_manifest: error starting %s service -> %s' % (service,
+                msg))
+            return msg
+   
+    """
+
+
+def new_manifest_bkup(json):
+    try:
+        parse = simplejson.loads(json)
+    except:
+        return 'Error parsing json'
+
+    ret_app = app_validation(json, parse)
+
+    if ret_app['status'] != 'continue':
+        return ret_app['status']
 
     for service in parse.get('Services'):
         try:

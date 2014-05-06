@@ -21,6 +21,7 @@ from string import Template
 from conpaas.core.log import create_logger
 from conpaas.core import iaas
 from conpaas.core import https
+from cpsdirector.common import log
 
 class Controller(object):
     """Implementation of the clouds controller. This class implements functions
@@ -107,6 +108,9 @@ class Controller(object):
         # Setting VM role
         self.role = 'agent'
 
+	self.__logger.debug("[Controller] [__init__] CREDIT_URL" + str(self.__conpaas_creditUrl))
+	log("[Controller] [__init__] CREDIT_URL" + str(self.__conpaas_creditUrl))
+
     def get_available_ipop_address(self):
         """Return an unassigned IP address in this manager's VPN subnet"""
         # Network iterator
@@ -133,9 +137,232 @@ class Controller(object):
                 return host
 
     #=========================================================================#
+    # create_node_manager(self, count, contextFile, test_agent, manager_node)#
+    #=========================================================================#
+    def create_node_manager(self, count, test_agent, port, manager_node, cloud=None, inst_type=None):
+        """
+        Creates the VMs associated with the list of nodes. It also tests
+        if the agents started correctly.
+
+        @param count The number of nodes to be created
+
+        @param test_agent A callback function to test if the agent
+                        started correctly in the newly created VM
+
+        @param port The port on which the agent will listen
+
+        @param cloud (Optional) If specified, this function will start new
+                        nodes inside cloud, otherwise it will start new nodes
+                        inside the default cloud or wherever the controller
+                        wants (for now only the default cloud is used)
+
+        @return A list of nodes of type node.ServiceNode
+
+        """
+        if count == 0:
+            return []
+
+        if cloud is None:
+            cloud = self.__default_cloud
+        """
+        if not self.deduct_credit(count):
+            raise Exception('Could not add nodes. Not enough credits.')
+        """
+
+	self.__logger.debug("[create_node_manager] node_info " + str(manager_node))
+        service_type = self.config_parser.get('manager', 'TYPE')
+
+        if (service_type == 'htc'):
+            # If HTC is used we need to update here as well (as I see no way to do this elsewhere)
+            self.add_context_replacement({
+            # 'CLOUD_VMID': cloud.cloud_vmid,
+            'CLOUD_NAME': cloud.cloud_name,
+            'CLOUD_MACHINE_TYPE': self.config_parser.get(cloud.cloud_name, 'INST_TYPE') ,
+            'CLOUD_COST_PER_TIME': self.config_parser.get(cloud.cloud_name, 'COST_PER_TIME'),
+            'CLOUD_MAX_VMS_ALL_CLOUDS': self.config_parser.get('iaas', 'MAX_VMS_ALL_CLOUDS'),
+            'CLOUD_MAX_VMS': self.config_parser.get(cloud.cloud_name, 'MAX_VMS')
+            }, cloud)
+
+        try:
+            self.__force_terminate_lock.acquire()
+            request_start = time.time()
+
+            service_type = self.config_parser.get('manager', 'TYPE')
+
+            if (service_type == 'htc'):
+                # If HTC is used we need to update here as well (as I see no way to do this elsewhere)
+                self.add_context_replacement({
+                    # 'CLOUD_VMID': cloud.cloud_vmid,
+                    'CLOUD_NAME': cloud.cloud_name,
+                    'CLOUD_MACHINE_TYPE': self.config_parser.get(cloud.cloud_name, 'INST_TYPE') ,
+                    'CLOUD_COST_PER_TIME': self.config_parser.get(cloud.cloud_name, 'COST_PER_TIME'),
+                    'CLOUD_MAX_VMS_ALL_CLOUDS': self.config_parser.get('iaas', 'MAX_VMS_ALL_CLOUDS'),
+                    'CLOUD_MAX_VMS': self.config_parser.get(cloud.cloud_name, 'MAX_VMS')
+                    }, cloud)
+
+            if self.__ipop_base_ip and self.__ipop_netmask:
+                # If IPOP has to be used we need to update VMs
+                # contextualization data for each new instance
+                vpn_ip = self.get_available_ipop_address()
+                self.add_context_replacement({ 'IPOP_IP_ADDRESS': vpn_ip }, cloud)
+                
+                # Set VPN IP
+                manager_node.ip = vpn_ip
+
+                if manager_node.private_ip == '':
+                    # If private_ip is not set yet, use vpn_ip
+                    manager_node.private_ip = vpn_ip
+
+        except Exception as e:
+            self.__logger.exception(
+                '[_create_manager_nodes]: Failed to associate Node to manager')
+            raise e
+        finally:
+            self.__force_terminate_lock.release()
+
+        ready = []
+        ready.append(manager_node)
+	self.__logger.debug("[Controller] [create_node_manager] len_ready " + str(len(ready)))
+	log("[Controller] [create_node_manager] len_ready " + str(len(ready)))
+
+        self.__force_terminate_lock.acquire()
+        self.__created_nodes += ready
+        self.__partially_created_nodes = []
+        self.__force_terminate_lock.release()
+
+        # start reservation timer with slack of 3 mins + time already wasted
+        # this should be enough time to terminate instances before
+        # hitting the following hour
+        timer = ReservationTimer([i.id for i in ready],
+                                 (55 * 60) - (time.time() - request_start),
+                                 self.__deduct_and_check_credit,
+                                 self.__reservation_logger)
+        timer.start()
+
+        self.__logger.debug('[_create_manager_nodes]: ip_node %s' %( manager_node.ip))
+        log('[_create_manager_nodes]: ip_node %s' %( manager_node.ip))
+        # set mappings
+        for i in ready:
+            self.__reservation_map[i.id] = timer
+        return ready
+    #=========================================================================#
     #               create_nodes(self, count, contextFile, test_agent)        #
     #=========================================================================#
-    def create_nodes(self, count, test_agent, port, cloud=None, inst_type=None):
+    def create_nodes_agent(self, count, test_agent, port, agent_nodes, cloud=None, inst_type=None):
+        """
+        Creates the VMs associated with the list of nodes. It also tests
+        if the agents started correctly.
+
+        @param count The number of nodes to be created
+
+        @param test_agent A callback function to test if the agent
+                        started correctly in the newly created VM
+
+        @param port The port on which the agent will listen
+
+        @param cloud (Optional) If specified, this function will start new
+                        nodes inside cloud, otherwise it will start new nodes
+                        inside the default cloud or wherever the controller
+                        wants (for now only the default cloud is used)
+
+        @return A list of nodes of type node.ServiceNode
+
+        """
+        ready = []
+        poll = []
+        iteration = 0
+
+        if count == 0:
+            return []
+
+        if cloud is None:
+            cloud = self.__default_cloud
+
+        if not self.deduct_credit(count):
+            raise Exception('Could not add nodes. Not enough credits.')
+
+        iteration += 1
+        msg = '[create_nodes] iter %d: creating %d nodes on cloud %s' % (iteration, count - len(ready), cloud.cloud_name)
+
+        if inst_type:
+             msg += ' of type %s' % inst_type
+
+        self.__logger.debug(msg)
+
+        try:
+            self.__force_terminate_lock.acquire()
+            if iteration == 1:
+                request_start = time.time()
+
+            service_type = self.config_parser.get('manager', 'TYPE')
+
+            if (service_type == 'htc'):
+                # If HTC is used we need to update here as well (as I see no way to do this elsewhere)
+                self.add_context_replacement({
+                    # 'CLOUD_VMID': cloud.cloud_vmid,
+                    'CLOUD_NAME': cloud.cloud_name,
+                    'CLOUD_MACHINE_TYPE': self.config_parser.get(cloud.cloud_name, 'INST_TYPE') ,
+                    'CLOUD_COST_PER_TIME': self.config_parser.get(cloud.cloud_name, 'COST_PER_TIME'),
+                    'CLOUD_MAX_VMS_ALL_CLOUDS': self.config_parser.get('iaas', 'MAX_VMS_ALL_CLOUDS'),
+                    'CLOUD_MAX_VMS': self.config_parser.get(cloud.cloud_name, 'MAX_VMS')
+                    }, cloud)
+
+                if self.__ipop_base_ip and self.__ipop_netmask:
+                    # If IPOP has to be used we need to update VMs
+                    # contextualization data for each new instance
+                    for _ in range(len(agent_nodes)):
+                        vpn_ip = self.get_available_ipop_address()
+                        self.add_context_replacement({ 'IPOP_IP_ADDRESS': vpn_ip }, cloud)
+                        # Set VPN IP
+                        agent_nodes[i].ip = vpn_ip
+
+                        if agent_nodes[i].private_ip == '':
+                            # If private_ip is not set yet, use vpn_ip
+                            agent_nodes[i].private_ip = vpn_ip
+
+                self.__logger.debug("cloud.new_instances returned %s" %
+                        self.__partially_created_nodes)
+
+        except Exception as e:
+            self.__logger.exception( '[_create_nodes]: Failed to request new nodes')
+            self.delete_nodes(agent_nodes)
+            self.__partially_created_nodes = []
+            raise e
+        finally:
+            self.__force_terminate_lock.release()
+            poll, failed = self.__wait_for_nodes(agent_nodes, test_agent, port)
+            ready += poll
+
+            poll = []
+            if failed:
+                self.__logger.debug('[_create_nodes]: %d nodes '
+                                    'failed to startup properly: %s'
+                                    % (len(failed), str(failed)))
+                self.__partially_created_nodes = []
+                self.delete_nodes(failed)
+
+        self.__force_terminate_lock.acquire()
+        self.__created_nodes += agent_nodes
+        self.__partially_created_nodes = []
+        self.__force_terminate_lock.release()
+
+        # start reservation timer with slack of 3 mins + time already wasted
+        # this should be enough time to terminate instances before
+        # hitting the following hour
+        timer = ReservationTimer([i.id for i in ready],
+                                 (55 * 60) - (time.time() - request_start),
+                                 self.__deduct_and_check_credit,
+                                 self.__reservation_logger)
+        timer.start()
+        # set mappings
+        for i in ready:
+            self.__reservation_map[i.id] = timer
+        return ready
+
+    #=========================================================================#
+    #               create_nodes(self, count, contextFile, test_agent)        #
+    #=========================================================================#
+    def create_nodes(self, count, test_agent, port,  cloud=None, inst_type=None):
         """
         Creates the VMs associated with the list of nodes. It also tests
         if the agents started correctly.
@@ -260,7 +487,6 @@ class Controller(object):
         for i in ready:
             self.__reservation_map[i.id] = timer
         return ready
-
     #=========================================================================#
     #                    delete_nodes(self, nodes)                            #
     #=========================================================================#

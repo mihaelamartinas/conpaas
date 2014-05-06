@@ -21,6 +21,7 @@ class ManagerController(Controller):
         self.config_parser = self.__get_config(str(service_id), str(user_id),
                                                str(app_id), service_name, vpn)
 
+	log('[Manager Controller] [__init__]')
         Controller.__init__(self, self.config_parser)
         self.service_name = service_name
         self.service_id = service_id
@@ -257,11 +258,14 @@ EOF
             reservation_timer.stop()
 
 
-def start(service_name, service_id, user_id, cloud_name, app_id, vpn):
+def start(service_name, service_id, user_id, cloud_name, app_id, vpn,
+        manager_node):
     """Start a manager for the given service_name, service_id and user_id,
        on cloud_name
 
     Return (node_ip, node_id, cloud_name)."""
+
+    log(dir(manager_node))
 
     if (cloud_name == 'default'):
         cloud_name = 'iaas'
@@ -275,10 +279,11 @@ def start(service_name, service_id, user_id, cloud_name, app_id, vpn):
     controller.generate_context(service_name, cloud)
 
     # FIXME: test_manager(ip, port) not implemented yet. Just return True.
-    node = controller.create_nodes(1, lambda ip, port: True, None, cloud)[0]
+    node = controller.create_node_manager(1, lambda ip, port: True, None, manager_node, cloud)[0]
 
     controller._stop_reservation_timer()
 
+    log(dir(node))
     return node.ip, node.vmid, cloud.get_cloud_name()
 
 @cloud_page.route("/available_clouds", methods=['GET'])

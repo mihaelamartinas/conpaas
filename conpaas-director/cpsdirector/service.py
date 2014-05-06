@@ -143,7 +143,7 @@ from cpsdirector.application import get_default_app, get_app_by_id
 
 from cpsdirector.user import cert_required
 
-def _start(servicetype, cloudname, appid):
+def _start(servicetype, cloudname, appid, manager_node):
     log('User %s creating a new %s service inside application %s' % (
 	    g.user.username, servicetype, appid))
 
@@ -172,7 +172,8 @@ def _start(servicetype, cloudname, appid):
 
     try:
         s.manager, s.vmid, s.cloud = manager_controller.start(
-            servicetype, s.sid, g.user.uid, cloudname, appid, vpn)
+            servicetype, s.sid, g.user.uid, cloudname, appid, vpn,
+            manager_node)
     except Exception, err:
         try:
             db.session.delete(s)
