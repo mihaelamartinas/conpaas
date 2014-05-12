@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Ths script is part of the contextualization file. It 
+# copies the source code on the VM, unpacks it, and sets
+# the PYTHONPATH environment variable. 
+
+# Is filled in by the director
+DIRECTOR=%DIRECTOR_URL%
+SOURCE=$DIRECTOR/download
+ROOT_DIR=/root
+CPS_HOME=$ROOT_DIR/ConPaaS
+
+LOG_FILE=/var/log/cpsmanager.log
+ETC=/etc/cpsmanager
+CERT_DIR=$ETC/certs
+VAR_TMP=/var/tmp/cpsmanager
+VAR_CACHE=/var/cache/cpsmanager
+VAR_RUN=/var/run/cpsmanager
+
+mkdir $CERT_DIR
+mv /tmp/*.pem $CERT_DIR
+
+wget --ca-certificate=$CERT_DIR/ca_cert.pem -P $ROOT_DIR/ $SOURCE/ConPaaS.tar.gz
+tar -zxf $ROOT_DIR/ConPaaS.tar.gz -C $ROOT_DIR/
+export PYTHONPATH=$CPS_HOME/src/:$CPS_HOME/contrib/
+
+
