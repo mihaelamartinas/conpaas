@@ -69,7 +69,7 @@ if __name__ == '__main__':
   Verify some sections and variables that must exist in the configuration file
   """
   config_vars = {
-    'init': [ 'LOG_FILE', 'CREDIT_URL', 'TERMINATE_URL'],
+    'init': ['LOG_FILE', 'TERMINATE_URL'],
     'iaas': ['DRIVER'],
   }
   config_ok = True
@@ -88,9 +88,9 @@ if __name__ == '__main__':
     sys.exit(1)
   
   # Initialize the context for the client   
-  https.client.conpaas_init_ssl_ctx(config_parser.get('initialization', 'CERT_DIR'),
-                                    'initialization', config_parser.get('initialization', 'USER_ID'),
-                                    config_parser.get('initialization', 'SERVICE_ID'))
+  https.client.conpaas_init_ssl_ctx(config_parser.get('init', 'CERT_DIR'),
+                                    'init', config_parser.get('init', 'USER_ID'),
+                                    '0')
 
   # Start the manager server
   print options.address, options.port

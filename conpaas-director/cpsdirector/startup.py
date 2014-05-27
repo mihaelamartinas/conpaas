@@ -6,7 +6,10 @@
 
 """
 
+import os.path
+import simplejson
 from conpaas.core import iaas
+from conpaas.core.misc import file_get_contents
 from cpsdirector.common import config_parser
 from cpsdirector.common import log
 from cpsdirector.x509cert import generate_certificate
@@ -15,8 +18,9 @@ import time
 
 class Startup(object):
 
-    def __init__(self):
+    def __init__(self, appid):
         self.__vmid = 0
+        self.__appid = appid
 
         self.__available_clouds = []
         self.__default_cloud = None
@@ -28,33 +32,120 @@ class Startup(object):
             self.__available_clouds.append(self.__default_cloud)
 
 	log("[startup init] cert_dir " + config_parser.get('conpaas','CERT_DIR'))
-        tmp_cert = generate_certificate(config_parser.get('conpaas','CERT_DIR'),
-						str(g.user.uid),
-						"initial_connect",
-						"tmp",
-						"info@conpaas.eu",
-                                           	"ConPaaS",
-                                           	"Contrail")
 
-	tmpl_values = {}	
-	tmpl_values['mngr_certs_cert'] = tmp_cert['cert']
-        tmpl_values['mngr_certs_key'] = tmp_cert['key']
-        tmpl_values['mngr_certs_ca_cert'] = tmp_cert['ca_cert']
 
-	self.__initial_ctx =  """
+	cloud = self.__default_cloud.get_cloud_type()
+	cloud_name = 'iaas'
 
-	cat <<EOF > /tmp/cert.pem
-	%(mngr_certs_cert)s
-	EOF
+        user_id = str(g.user.uid)
+        service_id = "0"
+        cert_dir = config_parser.get('conpaas', 'CERT_DIR')
+
+        conpaas_home = config_parser.get('conpaas', 'CONF_DIR')
+
+        cloud_scripts_dir = os.path.join(conpaas_home, 'scripts', 'cloud')
+        init_scripts_dir = os.path.join(conpaas_home, 'scripts', 'init')
+        director = config_parser.get('director', 'DIRECTOR_URL')
+        init_cfg_dir = os.path.join(conpaas_home, 'config', 'init')
+
+        # Values to be passed to the context file template
+        tmpl_values = {}
+
+        # Get contextualization script for the cloud
+        try:
+            tmpl_values['cloud_script'] = file_get_contents(
+                os.path.join(cloud_scripts_dir, cloud))
+        except IOError:
+            tmpl_values['cloud_script'] = ''
+
+        # Get cloud config values from director.cfg
+        cloud_sections = ['iaas']
+        if config_parser.has_option('iaas', 'OTHER_CLOUDS'):
+            cloud_sections.extend(
+                [cloud_name for cloud_name
+                 in config_parser.get('iaas', 'OTHER_CLOUDS').split(',')
+                 if config_parser.has_section(cloud_name)])
+
+        def __extract_cloud_cfg(section_name):
+            tmpl_values['cloud_cfg'] += "["+section_name+"]\n"
+            for key, value in config_parser.items(section_name):
+                tmpl_values['cloud_cfg'] += key.upper() + " = " + value + "\n"
+
+        tmpl_values['cloud_cfg'] = ''
+        for section_name in cloud_sections:
+            __extract_cloud_cfg(section_name)
+
+        # Get manager config file
+        init_cfg = file_get_contents(
+            os.path.join(init_cfg_dir, 'default-init.cfg'))
+
+        # Get manager setup file
+        init_setup = file_get_contents(
+            os.path.join(init_scripts_dir, 'init-setup'))
+
+        tmpl_values['init_setup'] = init_setup.replace('%DIRECTOR_URL%',
+                                                       director)
+
+
+        # Modify manager config file setting the required variables
+        init_cfg = init_cfg.replace('%DIRECTOR_URL%', director)
+	service_name = "init"
+	init_cfg = init_cfg.replace('%CONPAAS_SERVICE_TYPE%', service_name)
+
+        init_cfg = init_cfg.replace('%CLOUD_NAME%', cloud_name);
+        cloud = self.get_cloud_by_name(cloud_name)
+
+        # OpenNebula, EC2. etc
+        init_cfg = init_cfg.replace('%CLOUD_TYPE%',
+                config_parser.get(cloud_name, 'DRIVER'))  
+
+        if config_parser.has_option(cloud_name, 'INST_TYPE'):
+            init_cfg = init_cfg.replace('%CLOUD_MACHINE_TYPE%',
+                    config_parser.get(cloud_name, 'INST_TYPE'))
+
+
+	init_cfg = init_cfg.replace('%CONPAAS_USER_ID%', user_id)
+	init_cfg = init_cfg.replace('%CONPAAS_APP_ID%', self.__appid)
 	
-	cat <<EOF > /tmp/key.pem
-	%(mngr_certs_key)s
-	EOF
-	
-	cat <<EOF > /tmp/ca_cert.pem
-	%(mngr_certs_ca_cert)s
-	EOF""" % tmpl_values
+        tmpl_values['init_cfg'] = init_cfg
 
+        # Add default manager startup script
+        tmpl_values['init_start_script'] = file_get_contents(
+            os.path.join(init_scripts_dir, 'default-init-start'))
+
+        init_cert = generate_certificate(cert_dir, user_id, service_id,
+					"init",
+					"info@conpaas.eu",
+					"ConPaaS",
+					"Contrail")
+
+        tmpl_values['init_certs_cert'] = init_cert['cert']
+        tmpl_values['init_certs_key'] = init_cert['key']
+        tmpl_values['init_certs_ca_cert'] = init_cert['ca_cert']
+	self.__initial_ctx =  """%(cloud_script)s
+
+cat <<EOF > /tmp/cert.pem
+%(init_certs_cert)s
+EOF
+
+cat <<EOF > /tmp/key.pem
+%(init_certs_key)s
+EOF
+
+cat <<EOF > /tmp/ca_cert.pem
+%(init_certs_ca_cert)s
+EOF
+
+%(init_setup)s
+
+cat <<EOF > $ROOT_DIR/config.cfg
+%(cloud_cfg)s
+%(init_cfg)s
+EOF
+
+%(init_start_script)s""" % tmpl_values
+
+	log ("Initial context is " + self.__initial_ctx)
         if config_parser.has_option('iaas', 'OTHER_CLOUDS'):
             self.__available_clouds.append(iaas.get_clouds(config_parser))
 	
